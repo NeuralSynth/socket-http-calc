@@ -20,9 +20,11 @@ its own headers plus exactly Content-Length body bytes (or a chunked body),
 so several pipelined requests arriving in one recv() are answered in order.
 """
 
+import decimal
 import socket
 import sys
 import threading
+from email.utils import formatdate
 from urllib.parse import urlsplit, parse_qsl
 
 HOST = "0.0.0.0"
@@ -74,6 +76,7 @@ def build_response(status, body="", close=False, extra_headers=None):
     payload = body.encode("utf-8") if isinstance(body, str) else body
     lines = [
         f"HTTP/1.1 {status} {REASONS.get(status, 'Unknown')}",
+        f"Date: {formatdate(usegmt=True)}",
         "Content-Type: text/plain; charset=utf-8",
         f"Content-Length: {len(payload)}",
         "Connection: " + ("close" if close else "keep-alive"),
@@ -137,9 +140,16 @@ class Connection:
     def read_request(self):
         """Parse one request. Returns None if the peer closed cleanly
         between requests. Raises BadRequest on garbage."""
-        # Tolerate stray CRLFs between requests (RFC 7230 section 3.5).
-        while self.buf.startswith(b"\r\n"):
-            self.buf = self.buf[2:]
+        # Tolerate stray CRLFs before the request line (RFC 7230 section
+        # 3.5). They may already be buffered from a previous request or may
+        # still be on the wire, so strip and refill until real bytes appear.
+        while True:
+            while self.buf.startswith(b"\r\n"):
+                self.buf = self.buf[2:]
+            if self.buf and self.buf != b"\r":
+                break
+            if not self._fill():
+                return None
 
         head = self._read_until(b"\r\n\r\n", MAX_HEADER_BYTES, 431)
         if head is None:
@@ -171,7 +181,8 @@ class Connection:
             headers[name] = value if name not in headers else headers[name] + ", " + value
 
         body = self._read_body(headers)
-        return Request(method.upper(), target, version, headers, body)
+        # Methods are case-sensitive (RFC 7230 section 3.1.1): "get" is not GET.
+        return Request(method, target, version, headers, body)
 
     def _read_body(self, headers):
         te = headers.get("transfer-encoding")
@@ -235,7 +246,14 @@ def _div(a, b):
     # Caller has already rejected b == 0.
     if a % b == 0:
         return a // b
-    return a / b
+    try:
+        return a / b
+    except OverflowError:
+        # Quotient exceeds float range (~1e308). Fall back to Decimal with
+        # float-equivalent precision so arbitrary-size ints keep working.
+        with decimal.localcontext() as ctx:
+            ctx.prec = 17
+            return decimal.Decimal(a) / decimal.Decimal(b)
 
 
 OPERATIONS = {
@@ -261,7 +279,11 @@ def handle(req):
     if "host" not in req.headers:
         return 400, "missing Host header"
 
-    url = urlsplit(req.target)
+    try:
+        url = urlsplit(req.target)
+    except ValueError as e:
+        # e.g. an unbalanced IPv6 bracket in an absolute-form target
+        return 400, f"malformed request target: {e}"
     path = url.path
 
     if path not in OPERATIONS:
@@ -353,7 +375,13 @@ def log(peer, msg):
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else PORT
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            # Windows: SO_REUSEADDR would let a second server bind the same
+            # port and silently steal connections. Exclusive is what we want;
+            # Windows does not have the Unix TIME_WAIT rebind problem.
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((HOST, port))
         srv.listen(16)
         print(f"listening on {HOST}:{port}  (idle timeout {IDLE_TIMEOUT:.0f}s)", flush=True)
