@@ -12,8 +12,11 @@ import socket
 import sys
 import time
 
-HOST = sys.argv[1] if len(sys.argv) > 1 else "localhost"
-PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
+_FLAGS = [a for a in sys.argv[1:] if a.startswith("--")]
+_ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
+HOST = _ARGS[0] if len(_ARGS) > 0 else "localhost"
+PORT = int(_ARGS[1]) if len(_ARGS) > 1 else 8080
+QUICK = "--quick" in _FLAGS
 
 # The six requests from the assignment sheet, with the expected results.
 GRADER_SCRIPT = [
@@ -238,6 +241,63 @@ def run_idle_timeout(limit=10.0):
     s.close()
 
 
+def run_stray_crlf():
+    """RFC 7230 section 3.5: a server SHOULD ignore at least one empty line
+    before a request line. Must work whether the CRLFs arrive in the same
+    send as the request, in a send of their own, or after an earlier
+    request on the same connection."""
+    req = request_bytes("GET", "/add?a=1&b=2")
+
+    s = socket.create_connection((HOST, PORT)); s.settimeout(5); r = Reader(s)
+    s.sendall(b"\r\n\r\n" + req)
+    st, _, body = r.response()
+    check((st, body) == (200, "3"), f"CRLF+request in one send: {st} {body!r}")
+    print("   CRLFs then request in one send          -> 200")
+
+    s.sendall(b"\r\n\r\n"); time.sleep(0.2); s.sendall(req)
+    st, _, body = r.response()
+    check((st, body) == (200, "3"), f"CRLFs in separate send: {st} {body!r}")
+    print("   CRLFs in their own send, then request   -> 200")
+
+    s.sendall(req + b"\r\n" + req)
+    st1, _, b1 = r.response(); st2, _, b2 = r.response()
+    check((st1, b1, st2, b2) == (200, "3", 200, "3"), "CRLF between requests")
+    check(socket_still_open(s), "connection dropped after stray CRLFs")
+    print("   CRLF between two pipelined requests     -> 200, 200")
+    s.close()
+
+
+def run_edge_cases():
+    """Inputs that used to escape to the catch-all 500 handler."""
+    s = socket.create_connection((HOST, PORT)); s.settimeout(5); r = Reader(s)
+
+    s.sendall(b"GET http://[/add?a=1&b=2 HTTP/1.1\r\nHost: x\r\n\r\n")
+    st, hdrs, body = r.response()
+    check(st == 400, f"unbalanced IPv6 target: expected 400, got {st} {body!r}")
+    check(hdrs.get("connection") == "keep-alive", "semantic 400 should not close")
+    print(f"   GET http://[/add (bad IPv6 target)      -> {st}, kept alive")
+
+    big = str(10**400 + 1)
+    s.sendall(request_bytes("GET", f"/div?a={big}&b=3"))
+    st, _, body = r.response()
+    check(st == 200, f"huge inexact division: expected 200, got {st} {body!r}")
+    check(body.startswith("3.33333") and "E+399" in body, f"unexpected quotient {body!r}")
+    print(f"   /div with a 401-digit numerator         -> {st}  {body}")
+
+    s.sendall(b"get /add?a=1&b=2 HTTP/1.1\r\nHost: x\r\n\r\n")
+    st, hdrs, body = r.response()
+    check(st == 405, f"lowercase method: expected 405, got {st}")
+    check(hdrs.get("allow") == "GET", "405 missing Allow header")
+    print(f"   lowercase 'get' method                  -> {st}, Allow: GET")
+
+    s.sendall(request_bytes("GET", "/add?a=1&b=2"))
+    st, hdrs, body = r.response()
+    check("date" in hdrs, "response missing Date header")
+    check(hdrs["date"].endswith(" GMT"), f"Date not in IMF-fixdate form: {hdrs['date']!r}")
+    print(f"   Date header present                     -> {hdrs['date']}")
+    s.close()
+
+
 SCENARIOS = [
     ("grader script, sequential", lambda: run_sequential(GRADER_SCRIPT, "grader")),
     ("grader script, pipelined", lambda: run_pipelined(GRADER_SCRIPT, "grader")),
@@ -246,13 +306,14 @@ SCENARIOS = [
     ("Content-Length and chunked body framing", run_body_framing),
     ("Connection: close and HTTP/1.0", run_connection_close),
     ("malformed request", run_malformed),
+    ("stray CRLFs before a request", run_stray_crlf),
+    ("edge cases: bad target, huge division, method case, Date", run_edge_cases),
 ]
 
 
 def main():
-    quick = "--quick" in sys.argv
     scenarios = list(SCENARIOS)
-    if not quick:
+    if not QUICK:
         scenarios.append(("idle timeout (waits ~10s)", run_idle_timeout))
     failed = 0
     for name, fn in scenarios:
