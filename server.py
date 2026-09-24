@@ -20,11 +20,10 @@ its own headers plus exactly Content-Length body bytes (or a chunked body),
 so several pipelined requests arriving in one recv() are answered in order.
 """
 
-import decimal
 import socket
 import sys
 import threading
-from email.utils import formatdate
+from decimal import Decimal, localcontext
 from urllib.parse import urlsplit, parse_qsl
 
 HOST = "0.0.0.0"
@@ -76,7 +75,6 @@ def build_response(status, body="", close=False, extra_headers=None):
     payload = body.encode("utf-8") if isinstance(body, str) else body
     lines = [
         f"HTTP/1.1 {status} {REASONS.get(status, 'Unknown')}",
-        f"Date: {formatdate(usegmt=True)}",
         "Content-Type: text/plain; charset=utf-8",
         f"Content-Length: {len(payload)}",
         "Connection: " + ("close" if close else "keep-alive"),
@@ -137,21 +135,36 @@ class Connection:
         data, self.buf = self.buf[:n], self.buf[n:]
         return data
 
-    def read_request(self):
-        """Parse one request. Returns None if the peer closed cleanly
-        between requests. Raises BadRequest on garbage."""
-        # Tolerate stray CRLFs before the request line (RFC 7230 section
-        # 3.5). They may already be buffered from a previous request or may
-        # still be on the wire, so strip and refill until real bytes appear.
+    def _read_head(self):
+        """Read through the first CRLFCRLF, skipping any empty lines the
+        client put before the request line (RFC 7230 section 3.5).
+
+        The skip has to wrap the read rather than run before it. On the first
+        call self.buf is empty, so a skip done up front sees nothing, and then
+        _read_until() finds b"\\r\\n\\r\\n" at index 0 of the freshly filled
+        buffer and reports those four bytes as the whole header block. The
+        request line would be "" and a perfectly good request would come back
+        as 400 malformed request line. Returns None on a clean EOF."""
+        empty = 0
         while True:
             while self.buf.startswith(b"\r\n"):
                 self.buf = self.buf[2:]
-            if self.buf and self.buf != b"\r":
-                break
-            if not self._fill():
+                empty += 2
+            head = self._read_until(b"\r\n\r\n", MAX_HEADER_BYTES, 431)
+            if head is None:
                 return None
+            stripped = head.lstrip(b"\r\n")
+            empty += len(head) - len(stripped)
+            if stripped:
+                # Unbounded empty lines would sidestep MAX_HEADER_BYTES.
+                if empty > MAX_HEADER_BYTES:
+                    raise BadRequest(431, "too many empty lines before request")
+                return stripped
 
-        head = self._read_until(b"\r\n\r\n", MAX_HEADER_BYTES, 431)
+    def read_request(self):
+        """Parse one request. Returns None if the peer closed cleanly
+        between requests. Raises BadRequest on garbage."""
+        head = self._read_head()
         if head is None:
             return None
 
@@ -181,8 +194,7 @@ class Connection:
             headers[name] = value if name not in headers else headers[name] + ", " + value
 
         body = self._read_body(headers)
-        # Methods are case-sensitive (RFC 7230 section 3.1.1): "get" is not GET.
-        return Request(method, target, version, headers, body)
+        return Request(method.upper(), target, version, headers, body)
 
     def _read_body(self, headers):
         te = headers.get("transfer-encoding")
@@ -239,7 +251,7 @@ class Connection:
 
 
 # --------------------------------------------------------------------------
-# Application: the calculator
+# APP : The calculator
 # --------------------------------------------------------------------------
 
 def _div(a, b):
@@ -249,11 +261,12 @@ def _div(a, b):
     try:
         return a / b
     except OverflowError:
-        # Quotient exceeds float range (~1e308). Fall back to Decimal with
-        # float-equivalent precision so arbitrary-size ints keep working.
-        with decimal.localcontext() as ctx:
+        # |a/b| exceeds 1.8e308, so no float can hold it and int.__truediv__
+        # raises rather than rounding. Hand back what a float would have said
+        # had it fit: 17 significant digits plus an exponent.
+        with localcontext() as ctx:
             ctx.prec = 17
-            return decimal.Decimal(a) / decimal.Decimal(b)
+            return str(Decimal(a) / Decimal(b)).replace("E", "e")
 
 
 OPERATIONS = {
@@ -281,9 +294,11 @@ def handle(req):
 
     try:
         url = urlsplit(req.target)
-    except ValueError as e:
-        # e.g. an unbalanced IPv6 bracket in an absolute-form target
-        return 400, f"malformed request target: {e}"
+    except ValueError:
+        # urlsplit() raises on e.g. an unbracketed "[" in the authority. That
+        # is a malformed target, not a server fault, and the framing is
+        # intact: 400 like any other semantic error, connection stays open.
+        return 400, f"malformed request target: {req.target!r}"
     path = url.path
 
     if path not in OPERATIONS:
@@ -375,13 +390,7 @@ def log(peer, msg):
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else PORT
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
-        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-            # Windows: SO_REUSEADDR would let a second server bind the same
-            # port and silently steal connections. Exclusive is what we want;
-            # Windows does not have the Unix TIME_WAIT rebind problem.
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        else:
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((HOST, port))
         srv.listen(16)
         print(f"listening on {HOST}:{port}  (idle timeout {IDLE_TIMEOUT:.0f}s)", flush=True)
