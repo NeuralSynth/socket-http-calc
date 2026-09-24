@@ -41,8 +41,11 @@ python test_client.py localhost 8090 --quick   # skip the 10 s idle-timeout test
 | `GET /pow?a=2&b=8`      | 404    | `no such route: /pow`           |
 | `POST /add`             | 405    | `Allow: GET` header included    |
 
-`a` and `b` are base-10 integers, negatives allowed, arbitrary size.
-Every response carries `Content-Type`, `Content-Length` and `Connection`.
+`a` and `b` are base-10 integers, negatives allowed, arbitrary size. Inexact
+division is a float; if the quotient is too large for a float (about 308
+digits) it falls back to a 17-digit `Decimal`, e.g. `3.3333333333333333E+399`.
+Methods are case-sensitive, so `get /add` is a 405.
+Every response carries `Date`, `Content-Type`, `Content-Length` and `Connection`.
 
 Check order per request: Host present, then route exists (404), then method
 is GET (405), then parameters parse (400), then divide by zero (400).
